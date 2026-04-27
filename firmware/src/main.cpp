@@ -29,6 +29,8 @@
 #include <Adafruit_BME680.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BNO055.h>
+#include <nrf_gpio.h>
+#include <nrf_power.h>
 
 namespace {
 
@@ -56,9 +58,6 @@ constexpr uint8_t kNumScreens = 3;
 
 // Volatile variables modified by interrupts
 volatile int     currentScreen = 0;
-volatile bool    displayOn     = true;
-volatile bool    screenChanged = false;
-volatile bool    displayToggled = false;
 
 // Debounce timestamps
 volatile uint32_t lastEncoderTime = 0;
@@ -87,19 +86,11 @@ void encoderISR() {
   } else {
     currentScreen = (currentScreen - 1 + kNumScreens) % kNumScreens;
   }
-  screenChanged = true;
 }
 
 void switchISR() {
-  uint32_t now = millis();
-  if (now - lastSwTime < 500) return;  // increase from 200ms to 500ms
-  lastSwTime = now;
-  
-  // Verify pin is actually LOW (not just noise)
-  if (digitalRead(kSw) != LOW) return;
-  
-  displayOn      = !displayOn;
-  displayToggled = true;
+  // No debounce needed — after wakeup the chip reboots fresh
+  // This ISR is only used as the wakeup source from System OFF
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -326,13 +317,25 @@ void setup() {
 // ── Loop ──────────────────────────────────────────────────────────────────────
 void loop() {
   // ── Handle display toggle from ISR ──────────────────────────────────
-  if (displayToggled) {
-    displayToggled = false;
-    if (displayOn) {
-      display.setPowerSave(0);
-      playBootAnimation();
-    } else {
+  // ── Check for power button press ────────────────────────────────────
+  if (digitalRead(kSw) == LOW) {
+    uint32_t pressStart = millis();
+    // Wait for release with debounce
+    while (digitalRead(kSw) == LOW) delay(10);
+    if (millis() - pressStart > 50) {
+      // Turn off display
       display.setPowerSave(1);
+      display.clearBuffer();
+      display.sendBuffer();
+      delay(100);
+      // Enter System OFF — wakeup via SW pin DETECT
+      nrf_gpio_cfg_sense_input(
+        digitalPinToPinName(kSw),
+        NRF_GPIO_PIN_PULLUP,
+        NRF_GPIO_PIN_SENSE_LOW);
+      NRF_POWER->SYSTEMOFF = 1;
+      __DSB();
+      while (1);
     }
   }
 
@@ -374,7 +377,7 @@ void loop() {
   uvIndex = toUvIndex(sum / 10);
 
   // ── Render ───────────────────────────────────────────────────────────
-  if (displayOn) {
+  {
     display.clearBuffer();
     switch (currentScreen) {
       case 0: drawGps();                         break;
