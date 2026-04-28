@@ -41,6 +41,7 @@ constexpr uint8_t kOledRst   = 6;
 constexpr uint8_t kGpsCs     = 11;
 constexpr uint8_t kBmeCs     = 10;
 constexpr uint8_t kUvPin     = A1;
+constexpr uint8_t kVbatPin   = A6;
 constexpr uint8_t kClk       = A3;
 constexpr uint8_t kDt        = A0;
 constexpr uint8_t kSw        = A4;
@@ -74,6 +75,7 @@ struct GpsData {
   uint16_t year = 0;
 };
 GpsData gData;
+int gBatteryPct = 0;
 
 // ── Interrupt handlers ────────────────────────────────────────────────────────
 void encoderISR() {
@@ -98,6 +100,43 @@ float toUvIndex(int raw) {
   return (raw * (3.3f / 1023.0f)) / 0.1f;
 }
 
+float readBatteryVoltage() {
+  float measuredVbat = analogRead(kVbatPin);
+  measuredVbat *= 2.0f;     // Undo 2:1 divider on VBAT.
+  measuredVbat *= 3.6f;     // ADC reference voltage used by Feather docs.
+  measuredVbat /= 1024.0f;  // 10-bit ADC conversion scale.
+  return measuredVbat;
+}
+
+int batteryPercentFromVoltage(float vbat) {
+  constexpr float kEmptyV = 3.2f;
+  constexpr float kFullV  = 4.2f;
+
+  float pct = ((vbat - kEmptyV) / (kFullV - kEmptyV)) * 100.0f;
+  if (pct < 0.0f) pct = 0.0f;
+  if (pct > 100.0f) pct = 100.0f;
+  return (int)(pct + 0.5f);
+}
+
+void drawBatteryIndicator(int x, int y, int pct) {
+  constexpr uint8_t kBodyW = 10;
+  constexpr uint8_t kBodyH = 5;
+  constexpr uint8_t kTipW  = 1;
+  constexpr uint8_t kTipH  = 3;
+  constexpr uint8_t kPad   = 1;
+
+  display.drawFrame(x, y, kBodyW, kBodyH);
+  display.drawBox(x + kBodyW, y + (kBodyH - kTipH) / 2, kTipW, kTipH);
+
+  int innerW = kBodyW - (kPad * 2);
+  int fillW = (innerW * pct) / 100;
+  if (fillW < 1 && pct > 0) fillW = 1;
+  if (fillW > innerW) fillW = innerW;
+  if (fillW > 0) {
+    display.drawBox(x + kPad, y + kPad, fillW, kBodyH - (kPad * 2));
+  }
+}
+
 const char* uvRisk(float index) {
   if      (index < 3)  return "Low";
   else if (index < 6)  return "Moderate";
@@ -108,6 +147,12 @@ const char* uvRisk(float index) {
 
 // ── Shared header: time & date upper right ────────────────────────────────────
 void drawHeader() {
+  char pctBuf[8];
+  snprintf(pctBuf, sizeof(pctBuf), "%d%%", gBatteryPct);
+  display.setFont(u8g2_font_4x6_tf);
+  drawBatteryIndicator(2, 1, gBatteryPct);
+  display.drawStr(15, 6, pctBuf);
+
   display.setFont(u8g2_font_5x7_tf);
   char topBuf[24] = "--:---- --/--/--";
   if (gData.timeValid) {
@@ -375,6 +420,9 @@ void loop() {
   int sum = 0;
   for (int i = 0; i < 10; i++) { sum += analogRead(kUvPin); delay(2); }
   uvIndex = toUvIndex(sum / 10);
+
+  // ── Poll battery ──────────────────────────────────────────────────────
+  gBatteryPct = batteryPercentFromVoltage(readBatteryVoltage());
 
   // ── Render ───────────────────────────────────────────────────────────
   {
