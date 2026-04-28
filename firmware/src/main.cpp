@@ -55,10 +55,14 @@ Adafruit_BNO055    bno(55, 0x28, &Wire);
 
 // ── State ─────────────────────────────────────────────────────────────────────
 bool bmeOk = false, bnoOk = false, gpsOk = false;
-constexpr uint8_t kNumScreens = 3;
+enum class UiState : uint8_t {
+  Gps = 0,
+  Motion = 1,
+  Env = 2
+};
 
 // Volatile variables modified by interrupts
-volatile int     currentScreen = 0;
+volatile UiState currentState = UiState::Gps;
 
 // Debounce timestamps
 volatile uint32_t lastEncoderTime = 0;
@@ -77,6 +81,24 @@ struct GpsData {
 GpsData gData;
 int gBatteryPct = 0;
 
+UiState nextState(UiState state) {
+  switch (state) {
+    case UiState::Gps:    return UiState::Motion;
+    case UiState::Motion: return UiState::Env;
+    case UiState::Env:    return UiState::Gps;
+  }
+  return UiState::Gps;
+}
+
+UiState prevState(UiState state) {
+  switch (state) {
+    case UiState::Gps:    return UiState::Env;
+    case UiState::Motion: return UiState::Gps;
+    case UiState::Env:    return UiState::Motion;
+  }
+  return UiState::Gps;
+}
+
 // ── Interrupt handlers ────────────────────────────────────────────────────────
 void encoderISR() {
   uint32_t now = millis();
@@ -84,9 +106,9 @@ void encoderISR() {
   lastEncoderTime = now;
 
   if (digitalRead(kDt) != digitalRead(kClk)) {
-    currentScreen = (currentScreen + 1) % kNumScreens;
+    currentState = nextState(currentState);
   } else {
-    currentScreen = (currentScreen - 1 + kNumScreens) % kNumScreens;
+    currentState = prevState(currentState);
   }
 }
 
@@ -273,6 +295,14 @@ void drawEnv(float uvIndex, float tempC, float pressHpa) {
   display.drawStr(0, 42, uvBuf);
 }
 
+void renderCurrentState(UiState state, float accelXY, float heading, float uvIndex, float tempC, float pressHpa) {
+  switch (state) {
+    case UiState::Gps:    drawGps();                         break;
+    case UiState::Motion: drawMotion(accelXY, heading);      break;
+    case UiState::Env:    drawEnv(uvIndex, tempC, pressHpa); break;
+  }
+}
+
 // ── Boot animation ────────────────────────────────────────────────────────────
 struct Flake { float x, y, vy, vx; uint8_t size; };
 
@@ -427,11 +457,7 @@ void loop() {
   // ── Render ───────────────────────────────────────────────────────────
   {
     display.clearBuffer();
-    switch (currentScreen) {
-      case 0: drawGps();                         break;
-      case 1: drawMotion(accelXY, heading);      break;
-      case 2: drawEnv(uvIndex, tempC, pressHpa); break;
-    }
+    renderCurrentState(currentState, accelXY, heading, uvIndex, tempC, pressHpa);
     display.sendBuffer();
   }
 }
