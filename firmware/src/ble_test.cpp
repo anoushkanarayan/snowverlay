@@ -1,10 +1,10 @@
 /*
  * Feather nRF52840 Express — BLE sensor streaming test
  *
- * Streams all sensor data over BLE in three small JSON packets (~50 bytes each).
+ * Streams all sensor data over BLE as a single JSON packet.
  *
  * Build:  pio run -e ble_test -t upload
- * Monitor: screen /dev/cu.usbmodem* 115200
+ * Monitor: screen /dev/cu.usbmodem* 115200  (optional)
  */
 
 #include <Arduino.h>
@@ -68,10 +68,7 @@ void setup() {
   pinMode(kUvPin,   INPUT);
 
   Serial.begin(115200);
-  while (!Serial) {
-    digitalWrite(LED_RED, HIGH); delay(100);
-    digitalWrite(LED_RED, LOW);  delay(100);
-  }
+  delay(500);  // brief init delay, no blocking wait
 
   Serial.println("Initialising sensors...");
   Wire.begin();
@@ -103,7 +100,7 @@ void setup() {
   sensorService.begin();
   sensorChar.setProperties(CHR_PROPS_NOTIFY | CHR_PROPS_READ);
   sensorChar.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
-  sensorChar.setMaxLen(100);
+  sensorChar.setMaxLen(200);
   sensorChar.begin();
 
   startAdv();
@@ -124,7 +121,6 @@ void loop() {
     lat       = gps.getLatitude()  / 1e7;
     lon       = gps.getLongitude() / 1e7;
     speedMph  = gps.getGroundSpeed() / 1000.0f * 2.23694f;
-    bool timeValid = gps.getTimeValid() && gps.getDateValid();
     hour      = gps.getHour();
     minute    = gps.getMinute();
     year      = gps.getYear();
@@ -158,35 +154,23 @@ void loop() {
     heading = orientEvent.orientation.x;
   }
 
-  // ── Build 3 small packets (~50 bytes each) ────────────────────────────
-  char json1[60], json2[60], json3[60];
-
-  // Packet 1: GPS position
-  snprintf(json1, sizeof(json1),
-    "{\"la\":%.5f,\"lo\":%.5f,\"sp\":%.1f,\"fx\":%d}",
-    lat, lon, speedMph, fixValid ? 1 : 0);
-
-  // Packet 2: Time + temp + humidity
-  snprintf(json2, sizeof(json2),
-    "{\"h\":%u,\"m\":%u,\"mo\":%u,\"d\":%u,\"y\":%u,\"tm\":%.1f,\"hu\":%.1f}",
-    hour, minute, month, day, year % 100, tempC, humidity);
-
-  // Packet 3: Pressure + gas + UV + motion
-  snprintf(json3, sizeof(json3),
-    "{\"pr\":%.1f,\"ga\":%.1f,\"uv\":%.1f,\"ac\":%.2f,\"hd\":%.1f}",
-    pressHpa, gasKOhm, uvIndex, accelXY, heading);
+  // ── Build single JSON packet ──────────────────────────────────────────
+  char json[200];
+  snprintf(json, sizeof(json),
+    "{\"la\":%.5f,\"lo\":%.5f,\"sp\":%.1f,\"fx\":%d,"
+    "\"h\":%u,\"m\":%u,\"mo\":%u,\"d\":%u,\"y\":%u,"
+    "\"tm\":%.1f,\"hu\":%.1f,\"pr\":%.1f,\"ga\":%.1f,"
+    "\"uv\":%.1f,\"ac\":%.2f,\"hd\":%.1f}",
+    lat, lon, speedMph, fixValid ? 1 : 0,
+    hour, minute, month, day, year % 100,
+    tempC, humidity, pressHpa, gasKOhm,
+    uvIndex, accelXY, heading);
 
   if (Bluefruit.connected()) {
     digitalWrite(LED_BLUE, LOW);
     digitalWrite(LED_RED, HIGH);
-    sensorChar.notify((uint8_t*)json1, strlen(json1));
-    delay(100);
-    sensorChar.notify((uint8_t*)json2, strlen(json2));
-    delay(100);
-    sensorChar.notify((uint8_t*)json3, strlen(json3));
-    Serial.print("P1: "); Serial.println(json1);
-    Serial.print("P2: "); Serial.println(json2);
-    Serial.print("P3: "); Serial.println(json3);
+    sensorChar.notify((uint8_t*)json, strlen(json));
+    Serial.println(json);
     delay(50);
     digitalWrite(LED_RED, LOW);
   } else {
@@ -194,5 +178,5 @@ void loop() {
     Serial.println("Waiting for connection...");
   }
 
-  delay(1000);
+  delay(2000);
 }

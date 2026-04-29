@@ -1,9 +1,9 @@
 /*
- * snowverlay — main firmware
+ * snowverlay — main firmware with BLE
  *
- * Rotary encoder uses hardware interrupts for reliable rotation detection.
- * Button press toggles display on/off via interrupt.
- * All screens share GPS time/date in upper right.
+ * Rotary encoder cycles through 3 screens on the OLED.
+ * BLE streams all sensor data to the app.
+ * Button press powers off the device.
  *
  * Screens:
  *   0: GPS    — Lat, Lon, Time, Date
@@ -25,6 +25,7 @@
 #include <Wire.h>
 #include <math.h>
 #include <U8g2lib.h>
+#include <bluefruit.h>
 #include <SparkFun_u-blox_GNSS_v3.h>
 #include <Adafruit_BME680.h>
 #include <Adafruit_Sensor.h>
@@ -47,30 +48,29 @@ constexpr uint8_t kDt        = A0;
 constexpr uint8_t kSw        = A4;
 constexpr int8_t  kUtcOffset = -7;  // PDT
 
+// ── BLE UUIDs ────────────────────────────────────────────────────────────────
+#define SERVICE_UUID  "12345678-1234-1234-1234-123456789abc"
+#define SENSOR_UUID   "12345678-1234-1234-1234-123456789ab1"
+
 // ── Peripherals ───────────────────────────────────────────────────────────────
 U8G2_SSD1309_128X64_NONAME2_F_4W_HW_SPI display(U8G2_R0, kOledCs, kOledDc, kOledRst);
 SFE_UBLOX_GNSS_SPI gps;
 Adafruit_BME680    bme(kBmeCs, &SPI);
 Adafruit_BNO055    bno(55, 0x28, &Wire);
 
+BLEService        sensorService(SERVICE_UUID);
+BLECharacteristic sensorChar(SENSOR_UUID);
+
 // ── State ─────────────────────────────────────────────────────────────────────
 bool bmeOk = false, bnoOk = false, gpsOk = false;
-enum class UiState : uint8_t {
-  Gps = 0,
-  Motion = 1,
-  Env = 2
-};
 
-// Volatile variables modified by interrupts
+enum class UiState : uint8_t { Gps = 0, Motion = 1, Env = 2 };
 volatile UiState currentState = UiState::Gps;
 
-// Debounce timestamps
 volatile uint32_t lastEncoderTime = 0;
-volatile uint32_t lastSwTime      = 0;
-constexpr uint32_t kEncoderDebounce = 5;   // ms
-constexpr uint32_t kSwDebounce      = 200; // ms
+constexpr uint32_t kEncoderDebounce = 5;
 
-// ── GPS data shared across all screens ────────────────────────────────────────
+// ── GPS data ──────────────────────────────────────────────────────────────────
 struct GpsData {
   double   lat = 0.0, lon = 0.0;
   float    speedMph = 0.0f;
@@ -81,8 +81,13 @@ struct GpsData {
 GpsData gData;
 int gBatteryPct = 0;
 
-UiState nextState(UiState state) {
-  switch (state) {
+// ── Cached sensor values for BLE ──────────────────────────────────────────────
+float gTempC = 0, gHumidity = 0, gPressHpa = 0, gGasKOhm = 0;
+float gUvIndex = 0, gAccelXY = 0, gHeading = 0;
+
+// ── Screen navigation ─────────────────────────────────────────────────────────
+UiState nextState(UiState s) {
+  switch (s) {
     case UiState::Gps:    return UiState::Motion;
     case UiState::Motion: return UiState::Env;
     case UiState::Env:    return UiState::Gps;
@@ -90,8 +95,8 @@ UiState nextState(UiState state) {
   return UiState::Gps;
 }
 
-UiState prevState(UiState state) {
-  switch (state) {
+UiState prevState(UiState s) {
+  switch (s) {
     case UiState::Gps:    return UiState::Env;
     case UiState::Motion: return UiState::Gps;
     case UiState::Env:    return UiState::Motion;
@@ -104,18 +109,17 @@ void encoderISR() {
   uint32_t now = millis();
   if (now - lastEncoderTime < kEncoderDebounce) return;
   lastEncoderTime = now;
-
-  if (digitalRead(kDt) != digitalRead(kClk)) {
+  if (digitalRead(kDt) != digitalRead(kClk))
     currentState = nextState(currentState);
-  } else {
+  else
     currentState = prevState(currentState);
-  }
 }
 
-void switchISR() {
-  // No debounce needed — after wakeup the chip reboots fresh
-  // This ISR is only used as the wakeup source from System OFF
-}
+void switchISR() {}  // wakeup source only
+
+// ── BLE callbacks ─────────────────────────────────────────────────────────────
+void bleConnectCallback(uint16_t conn_handle) {}
+void bleDisconnectCallback(uint16_t conn_handle, uint8_t reason) {}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 float toUvIndex(int raw) {
@@ -123,51 +127,36 @@ float toUvIndex(int raw) {
 }
 
 float readBatteryVoltage() {
-  float measuredVbat = analogRead(kVbatPin);
-  measuredVbat *= 2.0f;     // Undo 2:1 divider on VBAT.
-  measuredVbat *= 3.6f;     // ADC reference voltage used by Feather docs.
-  measuredVbat /= 1024.0f;  // 10-bit ADC conversion scale.
-  return measuredVbat;
+  float v = analogRead(kVbatPin);
+  v *= 2.0f; v *= 3.6f; v /= 1024.0f;
+  return v;
 }
 
 int batteryPercentFromVoltage(float vbat) {
-  constexpr float kEmptyV = 3.2f;
-  constexpr float kFullV  = 4.2f;
-
-  float pct = ((vbat - kEmptyV) / (kFullV - kEmptyV)) * 100.0f;
+  float pct = ((vbat - 3.2f) / (4.2f - 3.2f)) * 100.0f;
   if (pct < 0.0f) pct = 0.0f;
   if (pct > 100.0f) pct = 100.0f;
   return (int)(pct + 0.5f);
 }
 
+const char* uvRisk(float i) {
+  if (i < 3)  return "Low";
+  if (i < 6)  return "Moderate";
+  if (i < 8)  return "High";
+  if (i < 11) return "Very High";
+  return "Extreme";
+}
+
 void drawBatteryIndicator(int x, int y, int pct) {
-  constexpr uint8_t kBodyW = 10;
-  constexpr uint8_t kBodyH = 5;
-  constexpr uint8_t kTipW  = 1;
-  constexpr uint8_t kTipH  = 3;
-  constexpr uint8_t kPad   = 1;
-
-  display.drawFrame(x, y, kBodyW, kBodyH);
-  display.drawBox(x + kBodyW, y + (kBodyH - kTipH) / 2, kTipW, kTipH);
-
-  int innerW = kBodyW - (kPad * 2);
-  int fillW = (innerW * pct) / 100;
+  constexpr uint8_t kW = 10, kH = 5, kTipW = 1, kTipH = 3, kPad = 1;
+  display.drawFrame(x, y, kW, kH);
+  display.drawBox(x + kW, y + (kH - kTipH) / 2, kTipW, kTipH);
+  int fillW = ((kW - kPad * 2) * pct) / 100;
   if (fillW < 1 && pct > 0) fillW = 1;
-  if (fillW > innerW) fillW = innerW;
-  if (fillW > 0) {
-    display.drawBox(x + kPad, y + kPad, fillW, kBodyH - (kPad * 2));
-  }
+  if (fillW > 0) display.drawBox(x + kPad, y + kPad, fillW, kH - kPad * 2);
 }
 
-const char* uvRisk(float index) {
-  if      (index < 3)  return "Low";
-  else if (index < 6)  return "Moderate";
-  else if (index < 8)  return "High";
-  else if (index < 11) return "Very High";
-  else                 return "Extreme";
-}
-
-// ── Shared header: time & date upper right ────────────────────────────────────
+// ── Shared header ─────────────────────────────────────────────────────────────
 void drawHeader() {
   char pctBuf[8];
   snprintf(pctBuf, sizeof(pctBuf), "%d%%", gBatteryPct);
@@ -197,7 +186,6 @@ void drawHeader() {
 void drawGps() {
   drawHeader();
   display.setFont(u8g2_font_5x7_tf);
-
   double absLat = (gData.lat < 0) ? -gData.lat : gData.lat;
   double absLon = (gData.lon < 0) ? -gData.lon : gData.lon;
   char latDir = (gData.lat < 0) ? 'S' : 'N';
@@ -206,19 +194,12 @@ void drawGps() {
   uint32_t latFrac = (uint32_t)((absLat - latDeg) * 100000UL);
   uint16_t lonDeg  = (uint16_t)absLon;
   uint32_t lonFrac = (uint32_t)((absLon - lonDeg) * 100000UL);
-
   char latLine[22], lonLine[22];
-  snprintf(latLine, sizeof(latLine), "Lat: %03u.%05lu %c",
-           latDeg, (unsigned long)latFrac, latDir);
-  snprintf(lonLine, sizeof(lonLine), "Lon: %03u.%05lu %c",
-           lonDeg, (unsigned long)lonFrac, lonDir);
-
+  snprintf(latLine, sizeof(latLine), "Lat: %03u.%05lu %c", latDeg, (unsigned long)latFrac, latDir);
+  snprintf(lonLine, sizeof(lonLine), "Lon: %03u.%05lu %c", lonDeg, (unsigned long)lonFrac, lonDir);
   display.drawStr(0, 24, latLine);
   display.drawStr(0, 34, lonLine);
-
-  if (!gData.fixValid) {
-    display.drawStr(32, 48, "Locating...");
-  }
+  if (!gData.fixValid) display.drawStr(32, 48, "Locating...");
 }
 
 // ── Screen 1: Motion ─────────────────────────────────────────────────────────
@@ -240,21 +221,13 @@ void drawCompass(int cx, int cy, int r, float heading) {
 void drawMotion(float accelXY, float heading) {
   drawHeader();
   display.setFont(u8g2_font_5x7_tf);
-
   char spdBuf[22], accelBuf[22];
-  if (gpsOk && gData.fixValid)
-    snprintf(spdBuf, sizeof(spdBuf), "Spd: %.1f mph", gData.speedMph);
-  else
-    snprintf(spdBuf, sizeof(spdBuf), "Spd: Locating...");
-
-  if (bnoOk)
-    snprintf(accelBuf, sizeof(accelBuf), "Accel: %.2f m/s2", accelXY);
-  else
-    snprintf(accelBuf, sizeof(accelBuf), "Accel: --");
-
+  if (gpsOk && gData.fixValid) snprintf(spdBuf,   sizeof(spdBuf),   "Spd: %.1f mph",    gData.speedMph);
+  else                          snprintf(spdBuf,   sizeof(spdBuf),   "Spd: Locating...");
+  if (bnoOk)                    snprintf(accelBuf, sizeof(accelBuf), "Accel: %.2f m/s2", accelXY);
+  else                          snprintf(accelBuf, sizeof(accelBuf), "Accel: --");
   display.drawStr(0, 22, spdBuf);
   display.drawStr(0, 32, accelBuf);
-
   char hdgBuf[16] = "--";
   if (bnoOk) {
     const char* cardDir;
@@ -277,68 +250,45 @@ void drawMotion(float accelXY, float heading) {
 void drawEnv(float uvIndex, float tempC, float pressHpa) {
   drawHeader();
   display.setFont(u8g2_font_5x7_tf);
-
   char tempBuf[22], presBuf[22], uvBuf[22];
   if (bmeOk) {
-    snprintf(tempBuf, sizeof(tempBuf), "Temp: %.1fF / %.1fC",
-             tempC * 9.0f / 5.0f + 32.0f, tempC);
+    snprintf(tempBuf, sizeof(tempBuf), "Temp: %.1fF / %.1fC", tempC * 9.0f / 5.0f + 32.0f, tempC);
     snprintf(presBuf, sizeof(presBuf), "Pres: %.1f hPa", pressHpa);
   } else {
     snprintf(tempBuf, sizeof(tempBuf), "Temp: --");
     snprintf(presBuf, sizeof(presBuf), "Pres: --");
   }
-  snprintf(uvBuf, sizeof(uvBuf), "UV: %.1f, Risk: %s",
-           uvIndex, uvRisk(uvIndex));
-
+  snprintf(uvBuf, sizeof(uvBuf), "UV: %.1f, Risk: %s", uvIndex, uvRisk(uvIndex));
   display.drawStr(0, 22, tempBuf);
   display.drawStr(0, 32, presBuf);
   display.drawStr(0, 42, uvBuf);
-}
-
-void renderCurrentState(UiState state, float accelXY, float heading, float uvIndex, float tempC, float pressHpa) {
-  switch (state) {
-    case UiState::Gps:    drawGps();                         break;
-    case UiState::Motion: drawMotion(accelXY, heading);      break;
-    case UiState::Env:    drawEnv(uvIndex, tempC, pressHpa); break;
-  }
 }
 
 // ── Boot animation ────────────────────────────────────────────────────────────
 struct Flake { float x, y, vy, vx; uint8_t size; };
 
 void playBootAnimation() {
-  constexpr uint8_t kMaxFlakes = 30;
-  constexpr uint8_t kFrames    = 90;
+  constexpr uint8_t kMaxFlakes = 30, kFrames = 90;
   Flake flakes[kMaxFlakes];
   uint8_t flakeCount = 0;
-
   auto makeFlake = [](Flake& f) {
-    f.x    = random(0, 128);
-    f.y    = -2;
-    f.vy   = 0.4f + random(0, 10) * 0.04f;
-    f.vx   = (random(0, 10) - 5) * 0.06f;
+    f.x = random(0, 128); f.y = -2;
+    f.vy = 0.4f + random(0, 10) * 0.04f;
+    f.vx = (random(0, 10) - 5) * 0.06f;
     f.size = (random(0, 10) < 3) ? 2 : 1;
   };
-
-  for (uint8_t i = 0; i < 8; i++) {
-    makeFlake(flakes[i]);
-    flakes[i].y = random(0, 64);
-  }
+  for (uint8_t i = 0; i < 8; i++) { makeFlake(flakes[i]); flakes[i].y = random(0, 64); }
   flakeCount = 8;
-
   for (uint8_t frame = 0; frame < kFrames; frame++) {
     display.clearBuffer();
     for (uint8_t i = 0; i < flakeCount; i++) {
-      flakes[i].x += flakes[i].vx;
-      flakes[i].y += flakes[i].vy;
+      flakes[i].x += flakes[i].vx; flakes[i].y += flakes[i].vy;
       if (flakes[i].x < 0)   flakes[i].x = 127;
       if (flakes[i].x > 127) flakes[i].x = 0;
       if (flakes[i].y > 66)  makeFlake(flakes[i]);
-      display.drawBox((int)flakes[i].x, (int)flakes[i].y,
-                      flakes[i].size, flakes[i].size);
+      display.drawBox((int)flakes[i].x, (int)flakes[i].y, flakes[i].size, flakes[i].size);
     }
-    if (frame % 8 == 0 && flakeCount < kMaxFlakes)
-      makeFlake(flakes[flakeCount++]);
+    if (frame % 8 == 0 && flakeCount < kMaxFlakes) makeFlake(flakes[flakeCount++]);
     if (frame > 30) {
       display.setFont(u8g2_font_ncenB10_tf);
       display.drawStr(14, 30, "snowverlay");
@@ -348,6 +298,18 @@ void playBootAnimation() {
     display.sendBuffer();
     delay(33);
   }
+}
+
+// ── BLE advertising ───────────────────────────────────────────────────────────
+void startAdv() {
+  Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
+  Bluefruit.Advertising.addTxPower();
+  Bluefruit.Advertising.addService(sensorService);
+  Bluefruit.ScanResponse.addName();
+  Bluefruit.Advertising.restartOnDisconnect(true);
+  Bluefruit.Advertising.setInterval(32, 244);
+  Bluefruit.Advertising.setFastTimeout(30);
+  Bluefruit.Advertising.start(0);
 }
 
 }  // namespace
@@ -361,9 +323,9 @@ void setup() {
   pinMode(kClk,    INPUT_PULLUP);
   pinMode(kDt,     INPUT_PULLUP);
   pinMode(kSw,     INPUT_PULLUP);
-  pinMode(LED_RED, OUTPUT);
+  pinMode(LED_RED,  OUTPUT);
+  pinMode(LED_BLUE, OUTPUT);
 
-  // Attach interrupts
   attachInterrupt(digitalPinToInterrupt(kClk), encoderISR, FALLING);
   attachInterrupt(digitalPinToInterrupt(kSw),  switchISR,  FALLING);
 
@@ -387,23 +349,35 @@ void setup() {
 
   bnoOk = bno.begin();
   if (bnoOk) bno.setExtCrystalUse(true);
+
+  // Init BLE
+  Bluefruit.begin();
+  Bluefruit.setTxPower(4);
+  Bluefruit.setName("snowverlay");
+  Bluefruit.Periph.setConnectCallback(bleConnectCallback);
+  Bluefruit.Periph.setDisconnectCallback(bleDisconnectCallback);
+
+  sensorService.begin();
+  sensorChar.setProperties(CHR_PROPS_NOTIFY | CHR_PROPS_READ);
+  sensorChar.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
+  sensorChar.setMaxLen(200);
+  sensorChar.begin();
+
+  startAdv();
+  digitalWrite(LED_BLUE, HIGH);
 }
 
 // ── Loop ──────────────────────────────────────────────────────────────────────
 void loop() {
-  // ── Handle display toggle from ISR ──────────────────────────────────
-  // ── Check for power button press ────────────────────────────────────
+  // ── Power button ─────────────────────────────────────────────────────
   if (digitalRead(kSw) == LOW) {
     uint32_t pressStart = millis();
-    // Wait for release with debounce
     while (digitalRead(kSw) == LOW) delay(10);
     if (millis() - pressStart > 50) {
-      // Turn off display
       display.setPowerSave(1);
       display.clearBuffer();
       display.sendBuffer();
       delay(100);
-      // Enter System OFF — wakeup via SW pin DETECT
       nrf_gpio_cfg_sense_input(
         digitalPinToPinName(kSw),
         NRF_GPIO_PIN_PULLUP,
@@ -430,34 +404,56 @@ void loop() {
   }
 
   // ── Poll BNO055 ──────────────────────────────────────────────────────
-  float accelXY = 0, heading = 0;
   if (bnoOk) {
     sensors_event_t accelEvent, orientEvent;
     bno.getEvent(&accelEvent, Adafruit_BNO055::VECTOR_ACCELEROMETER);
     bno.getEvent(&orientEvent, Adafruit_BNO055::VECTOR_EULER);
     float ax = accelEvent.acceleration.x;
     float ay = accelEvent.acceleration.y;
-    accelXY = sqrt(ax*ax + ay*ay);
-    heading = orientEvent.orientation.x;
+    gAccelXY = sqrt(ax*ax + ay*ay);
+    gHeading = orientEvent.orientation.x;
   }
 
   // ── Poll BME688 + UV ─────────────────────────────────────────────────
-  float tempC = 0, pressHpa = 0, uvIndex = 0;
   if (bmeOk && bme.performReading()) {
-    tempC    = bme.temperature;
-    pressHpa = bme.pressure / 100.0f;
+    gTempC    = bme.temperature;
+    gHumidity = bme.humidity;
+    gPressHpa = bme.pressure / 100.0f;
+    gGasKOhm  = bme.gas_resistance / 1000.0f;
   }
   int sum = 0;
   for (int i = 0; i < 10; i++) { sum += analogRead(kUvPin); delay(2); }
-  uvIndex = toUvIndex(sum / 10);
+  gUvIndex = toUvIndex(sum / 10);
 
-  // ── Poll battery ──────────────────────────────────────────────────────
+  // ── Poll battery ─────────────────────────────────────────────────────
   gBatteryPct = batteryPercentFromVoltage(readBatteryVoltage());
 
-  // ── Render ───────────────────────────────────────────────────────────
-  {
-    display.clearBuffer();
-    renderCurrentState(currentState, accelXY, heading, uvIndex, tempC, pressHpa);
-    display.sendBuffer();
+  // ── Send BLE notification ─────────────────────────────────────────────
+  if (Bluefruit.connected()) {
+    digitalWrite(LED_BLUE, LOW);
+    char json[200];
+    snprintf(json, sizeof(json),
+      "{\"la\":%.5f,\"lo\":%.5f,\"sp\":%.1f,\"fx\":%d,"
+      "\"h\":%u,\"m\":%u,\"mo\":%u,\"d\":%u,\"y\":%u,"
+      "\"tm\":%.1f,\"hu\":%.1f,\"pr\":%.1f,\"ga\":%.1f,"
+      "\"uv\":%.1f,\"ac\":%.2f,\"hd\":%.1f,\"bt\":%d}",
+      gData.lat, gData.lon, gData.speedMph, gData.fixValid ? 1 : 0,
+      gData.hour, gData.minute, gData.month, gData.day, gData.year % 100,
+      gTempC, gHumidity, gPressHpa, gGasKOhm,
+      gUvIndex, gAccelXY, gHeading, gBatteryPct);
+    sensorChar.notify((uint8_t*)json, strlen(json));
+  } else {
+    digitalWrite(LED_BLUE, HIGH);
   }
+
+  // ── Render display ───────────────────────────────────────────────────
+  display.clearBuffer();
+  switch (currentState) {
+    case UiState::Gps:    drawGps();                              break;
+    case UiState::Motion: drawMotion(gAccelXY, gHeading);        break;
+    case UiState::Env:    drawEnv(gUvIndex, gTempC, gPressHpa);  break;
+  }
+  display.sendBuffer();
+
+  delay(2000);
 }

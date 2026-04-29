@@ -9,10 +9,10 @@
             "name": "PlatformIO",
             "includePath": [
                 "/Users/andreaguerrero/Desktop/snowverlay/firmware/src",
+                "/Users/andreaguerrero/Desktop/snowverlay/firmware/.pio/libdeps/display/SdFat - Adafruit Fork/src",
                 "/Users/andreaguerrero/Desktop/snowverlay/firmware/.pio/libdeps/display/U8g2/src",
                 "/Users/andreaguerrero/.platformio/packages/framework-arduinoadafruitnrf52/libraries/Wire",
                 "/Users/andreaguerrero/Desktop/snowverlay/firmware/.pio/libdeps/display/Adafruit TinyUSB Library/src",
-                "/Users/andreaguerrero/Desktop/snowverlay/firmware/.pio/libdeps/display/SdFat - Adafruit Fork/src",
                 "/Users/andreaguerrero/.platformio/packages/framework-arduinoadafruitnrf52/libraries/Adafruit_TinyUSB_Arduino/src",
                 "/Users/andreaguerrero/.platformio/packages/framework-arduinoadafruitnrf52/libraries/SPI",
                 "/Users/andreaguerrero/.platformio/packages/framework-cmsis/CMSIS/Core/Include",
@@ -54,10 +54,10 @@
                 "limitSymbolsToIncludedHeaders": true,
                 "path": [
                     "/Users/andreaguerrero/Desktop/snowverlay/firmware/src",
+                    "/Users/andreaguerrero/Desktop/snowverlay/firmware/.pio/libdeps/display/SdFat - Adafruit Fork/src",
                     "/Users/andreaguerrero/Desktop/snowverlay/firmware/.pio/libdeps/display/U8g2/src",
                     "/Users/andreaguerrero/.platformio/packages/framework-arduinoadafruitnrf52/libraries/Wire",
                     "/Users/andreaguerrero/Desktop/snowverlay/firmware/.pio/libdeps/display/Adafruit TinyUSB Library/src",
-                    "/Users/andreaguerrero/Desktop/snowverlay/firmware/.pio/libdeps/display/SdFat - Adafruit Fork/src",
                     "/Users/andreaguerrero/.platformio/packages/framework-arduinoadafruitnrf52/libraries/Adafruit_TinyUSB_Arduino/src",
                     "/Users/andreaguerrero/.platformio/packages/framework-arduinoadafruitnrf52/libraries/SPI",
                     "/Users/andreaguerrero/.platformio/packages/framework-cmsis/CMSIS/Core/Include",
