@@ -41,6 +41,7 @@ constexpr uint8_t kOledRst   = 6;
 constexpr uint8_t kGpsCs     = 11;
 constexpr uint8_t kBmeCs     = 10;
 constexpr uint8_t kUvPin     = A1;
+constexpr uint8_t kVbatPin   = A6;
 constexpr uint8_t kClk       = A3;
 constexpr uint8_t kDt        = A0;
 constexpr uint8_t kSw        = A4;
@@ -54,10 +55,14 @@ Adafruit_BNO055    bno(55, 0x28, &Wire);
 
 // ── State ─────────────────────────────────────────────────────────────────────
 bool bmeOk = false, bnoOk = false, gpsOk = false;
-constexpr uint8_t kNumScreens = 3;
+enum class UiState : uint8_t {
+  Gps = 0,
+  Motion = 1,
+  Env = 2
+};
 
 // Volatile variables modified by interrupts
-volatile int     currentScreen = 0;
+volatile UiState currentState = UiState::Gps;
 
 // Debounce timestamps
 volatile uint32_t lastEncoderTime = 0;
@@ -74,6 +79,25 @@ struct GpsData {
   uint16_t year = 0;
 };
 GpsData gData;
+int gBatteryPct = 0;
+
+UiState nextState(UiState state) {
+  switch (state) {
+    case UiState::Gps:    return UiState::Motion;
+    case UiState::Motion: return UiState::Env;
+    case UiState::Env:    return UiState::Gps;
+  }
+  return UiState::Gps;
+}
+
+UiState prevState(UiState state) {
+  switch (state) {
+    case UiState::Gps:    return UiState::Env;
+    case UiState::Motion: return UiState::Gps;
+    case UiState::Env:    return UiState::Motion;
+  }
+  return UiState::Gps;
+}
 
 // ── Interrupt handlers ────────────────────────────────────────────────────────
 void encoderISR() {
@@ -82,9 +106,9 @@ void encoderISR() {
   lastEncoderTime = now;
 
   if (digitalRead(kDt) != digitalRead(kClk)) {
-    currentScreen = (currentScreen + 1) % kNumScreens;
+    currentState = nextState(currentState);
   } else {
-    currentScreen = (currentScreen - 1 + kNumScreens) % kNumScreens;
+    currentState = prevState(currentState);
   }
 }
 
@@ -98,6 +122,43 @@ float toUvIndex(int raw) {
   return (raw * (3.3f / 1023.0f)) / 0.1f;
 }
 
+float readBatteryVoltage() {
+  float measuredVbat = analogRead(kVbatPin);
+  measuredVbat *= 2.0f;     // Undo 2:1 divider on VBAT.
+  measuredVbat *= 3.6f;     // ADC reference voltage used by Feather docs.
+  measuredVbat /= 1024.0f;  // 10-bit ADC conversion scale.
+  return measuredVbat;
+}
+
+int batteryPercentFromVoltage(float vbat) {
+  constexpr float kEmptyV = 3.2f;
+  constexpr float kFullV  = 4.2f;
+
+  float pct = ((vbat - kEmptyV) / (kFullV - kEmptyV)) * 100.0f;
+  if (pct < 0.0f) pct = 0.0f;
+  if (pct > 100.0f) pct = 100.0f;
+  return (int)(pct + 0.5f);
+}
+
+void drawBatteryIndicator(int x, int y, int pct) {
+  constexpr uint8_t kBodyW = 10;
+  constexpr uint8_t kBodyH = 5;
+  constexpr uint8_t kTipW  = 1;
+  constexpr uint8_t kTipH  = 3;
+  constexpr uint8_t kPad   = 1;
+
+  display.drawFrame(x, y, kBodyW, kBodyH);
+  display.drawBox(x + kBodyW, y + (kBodyH - kTipH) / 2, kTipW, kTipH);
+
+  int innerW = kBodyW - (kPad * 2);
+  int fillW = (innerW * pct) / 100;
+  if (fillW < 1 && pct > 0) fillW = 1;
+  if (fillW > innerW) fillW = innerW;
+  if (fillW > 0) {
+    display.drawBox(x + kPad, y + kPad, fillW, kBodyH - (kPad * 2));
+  }
+}
+
 const char* uvRisk(float index) {
   if      (index < 3)  return "Low";
   else if (index < 6)  return "Moderate";
@@ -108,6 +169,12 @@ const char* uvRisk(float index) {
 
 // ── Shared header: time & date upper right ────────────────────────────────────
 void drawHeader() {
+  char pctBuf[8];
+  snprintf(pctBuf, sizeof(pctBuf), "%d%%", gBatteryPct);
+  display.setFont(u8g2_font_4x6_tf);
+  drawBatteryIndicator(2, 1, gBatteryPct);
+  display.drawStr(15, 6, pctBuf);
+
   display.setFont(u8g2_font_5x7_tf);
   char topBuf[24] = "--:---- --/--/--";
   if (gData.timeValid) {
@@ -226,6 +293,14 @@ void drawEnv(float uvIndex, float tempC, float pressHpa) {
   display.drawStr(0, 22, tempBuf);
   display.drawStr(0, 32, presBuf);
   display.drawStr(0, 42, uvBuf);
+}
+
+void renderCurrentState(UiState state, float accelXY, float heading, float uvIndex, float tempC, float pressHpa) {
+  switch (state) {
+    case UiState::Gps:    drawGps();                         break;
+    case UiState::Motion: drawMotion(accelXY, heading);      break;
+    case UiState::Env:    drawEnv(uvIndex, tempC, pressHpa); break;
+  }
 }
 
 // ── Boot animation ────────────────────────────────────────────────────────────
@@ -376,14 +451,13 @@ void loop() {
   for (int i = 0; i < 10; i++) { sum += analogRead(kUvPin); delay(2); }
   uvIndex = toUvIndex(sum / 10);
 
+  // ── Poll battery ──────────────────────────────────────────────────────
+  gBatteryPct = batteryPercentFromVoltage(readBatteryVoltage());
+
   // ── Render ───────────────────────────────────────────────────────────
   {
     display.clearBuffer();
-    switch (currentScreen) {
-      case 0: drawGps();                         break;
-      case 1: drawMotion(accelXY, heading);      break;
-      case 2: drawEnv(uvIndex, tempC, pressHpa); break;
-    }
+    renderCurrentState(currentState, accelXY, heading, uvIndex, tempC, pressHpa);
     display.sendBuffer();
   }
 }
