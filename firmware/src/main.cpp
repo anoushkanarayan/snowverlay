@@ -11,13 +11,6 @@
  *   2: Env    — Temp, Pressure, UV, Risk
  *
  * Build:  pio run -e main -t upload
- *
- * ── Pin assignments ───────────────────────────────────────────────────────────
- *   OLED CS  -> 5   OLED DC  -> 9   OLED RST -> 6
- *   GPS CS   -> 11  BME CS   -> 10
- *   BNO055   -> SDA/SCL (I2C)
- *   UV       -> A1
- *   Encoder CLK -> A3   DT -> A0   SW -> A4
  */
 
 #include <Arduino.h>
@@ -39,7 +32,7 @@ namespace {
 constexpr uint8_t kOledCs    = 5;
 constexpr uint8_t kOledDc    = 9;
 constexpr uint8_t kOledRst   = 6;
-constexpr uint8_t kGpsCs     = 11;
+constexpr uint8_t kGpsCs     = 12;
 constexpr uint8_t kBmeCs     = 10;
 constexpr uint8_t kUvPin     = A1;
 constexpr uint8_t kVbatPin   = A6;
@@ -48,12 +41,16 @@ constexpr uint8_t kDt        = A0;
 constexpr uint8_t kSw        = A4;
 constexpr int8_t  kUtcOffset = -7;  // PDT
 
+// ── Display offset (shift all content right and down) ─────────────────────────
+constexpr int8_t kXOff = 3;  // pixels right
+constexpr int8_t kYOff = 14;  // pixels down
+
 // ── BLE UUIDs ────────────────────────────────────────────────────────────────
 #define SERVICE_UUID  "12345678-1234-1234-1234-123456789abc"
 #define SENSOR_UUID   "12345678-1234-1234-1234-123456789ab1"
 
 // ── Peripherals ───────────────────────────────────────────────────────────────
-U8G2_SSD1309_128X64_NONAME2_F_4W_HW_SPI display(U8G2_R0, kOledCs, kOledDc, kOledRst);
+U8G2_SSD1309_128X64_NONAME2_F_4W_HW_SPI display(U8G2_R2, kOledCs, kOledDc, kOledRst);
 SFE_UBLOX_GNSS_SPI gps;
 Adafruit_BME680    bme(kBmeCs, &SPI);
 Adafruit_BNO055    bno(55, 0x28, &Wire);
@@ -115,9 +112,8 @@ void encoderISR() {
     currentState = prevState(currentState);
 }
 
-void switchISR() {}  // wakeup source only
+void switchISR() {}
 
-// ── BLE callbacks ─────────────────────────────────────────────────────────────
 void bleConnectCallback(uint16_t conn_handle) {}
 void bleDisconnectCallback(uint16_t conn_handle, uint8_t reason) {}
 
@@ -148,6 +144,7 @@ const char* uvRisk(float i) {
 }
 
 void drawBatteryIndicator(int x, int y, int pct) {
+  x += kXOff; y += kYOff;
   constexpr uint8_t kW = 10, kH = 5, kTipW = 1, kTipH = 3, kPad = 1;
   display.drawFrame(x, y, kW, kH);
   display.drawBox(x + kW, y + (kH - kTipH) / 2, kTipW, kTipH);
@@ -162,7 +159,7 @@ void drawHeader() {
   snprintf(pctBuf, sizeof(pctBuf), "%d%%", gBatteryPct);
   display.setFont(u8g2_font_4x6_tf);
   drawBatteryIndicator(2, 1, gBatteryPct);
-  display.drawStr(15, 6, pctBuf);
+  display.drawStr(15 + kXOff, 6 + kYOff, pctBuf);
 
   display.setFont(u8g2_font_5x7_tf);
   char topBuf[24] = "--:---- --/--/--";
@@ -178,14 +175,15 @@ void drawHeader() {
              h, gData.minute, ampm, m, d, gData.year % 100);
   }
   int topX = 128 - (strlen(topBuf) * 5) - 8;
-  display.drawStr(topX, 8, topBuf);
-  display.drawHLine(0, 10, 128);
+  display.drawStr(topX, 8 + kYOff, topBuf);
+  display.drawHLine(0, 10 + kYOff, 128);
 }
 
 // ── Screen 0: GPS ─────────────────────────────────────────────────────────────
 void drawGps() {
   drawHeader();
   display.setFont(u8g2_font_5x7_tf);
+
   double absLat = (gData.lat < 0) ? -gData.lat : gData.lat;
   double absLon = (gData.lon < 0) ? -gData.lon : gData.lon;
   char latDir = (gData.lat < 0) ? 'S' : 'N';
@@ -194,16 +192,21 @@ void drawGps() {
   uint32_t latFrac = (uint32_t)((absLat - latDeg) * 100000UL);
   uint16_t lonDeg  = (uint16_t)absLon;
   uint32_t lonFrac = (uint32_t)((absLon - lonDeg) * 100000UL);
+
   char latLine[22], lonLine[22];
   snprintf(latLine, sizeof(latLine), "Lat: %03u.%05lu %c", latDeg, (unsigned long)latFrac, latDir);
   snprintf(lonLine, sizeof(lonLine), "Lon: %03u.%05lu %c", lonDeg, (unsigned long)lonFrac, lonDir);
-  display.drawStr(0, 24, latLine);
-  display.drawStr(0, 34, lonLine);
-  if (!gData.fixValid) display.drawStr(32, 48, "Locating...");
+
+  display.drawStr(0 + kXOff, 24 + kYOff, latLine);
+  display.drawStr(0 + kXOff, 34 + kYOff, lonLine);
+
+  if (!gData.fixValid)
+    display.drawStr(32 + kXOff, 48 + kYOff, "Locating...");
 }
 
 // ── Screen 1: Motion ─────────────────────────────────────────────────────────
 void drawCompass(int cx, int cy, int r, float heading) {
+  cx += kXOff; cy += kYOff;
   display.drawLine(cx, cy - r, cx, cy + r);
   display.drawLine(cx - r, cy, cx + r, cy);
   display.setFont(u8g2_font_5x7_tf);
@@ -221,13 +224,16 @@ void drawCompass(int cx, int cy, int r, float heading) {
 void drawMotion(float accelXY, float heading) {
   drawHeader();
   display.setFont(u8g2_font_5x7_tf);
+
   char spdBuf[22], accelBuf[22];
   if (gpsOk && gData.fixValid) snprintf(spdBuf,   sizeof(spdBuf),   "Spd: %.1f mph",    gData.speedMph);
   else                          snprintf(spdBuf,   sizeof(spdBuf),   "Spd: Locating...");
   if (bnoOk)                    snprintf(accelBuf, sizeof(accelBuf), "Accel: %.2f m/s2", accelXY);
   else                          snprintf(accelBuf, sizeof(accelBuf), "Accel: --");
-  display.drawStr(0, 22, spdBuf);
-  display.drawStr(0, 32, accelBuf);
+
+  display.drawStr(0 + kXOff, 22 + kYOff, spdBuf);
+  display.drawStr(0 + kXOff, 32 + kYOff, accelBuf);
+
   char hdgBuf[16] = "--";
   if (bnoOk) {
     const char* cardDir;
@@ -241,15 +247,18 @@ void drawMotion(float accelXY, float heading) {
     else                                            cardDir = "NW";
     snprintf(hdgBuf, sizeof(hdgBuf), "%.0f\xb0 %s", heading, cardDir);
   }
-  display.drawStr(0, 44, "Heading:");
-  display.drawStr(0, 54, hdgBuf);
-  drawCompass(100, 40, 10, heading);
+  // combined heading label + value on one line
+  char hdgLineBuf[24];
+  snprintf(hdgLineBuf, sizeof(hdgLineBuf), "Heading: %s", hdgBuf);
+  display.drawStr(0 + kXOff, 44 + kYOff, hdgLineBuf);
+  drawCompass(104, 33, 8, heading);
 }
 
 // ── Screen 2: Environment ─────────────────────────────────────────────────────
 void drawEnv(float uvIndex, float tempC, float pressHpa) {
   drawHeader();
   display.setFont(u8g2_font_5x7_tf);
+
   char tempBuf[22], presBuf[22], uvBuf[22];
   if (bmeOk) {
     snprintf(tempBuf, sizeof(tempBuf), "Temp: %.1fF / %.1fC", tempC * 9.0f / 5.0f + 32.0f, tempC);
@@ -259,9 +268,10 @@ void drawEnv(float uvIndex, float tempC, float pressHpa) {
     snprintf(presBuf, sizeof(presBuf), "Pres: --");
   }
   snprintf(uvBuf, sizeof(uvBuf), "UV: %.1f, Risk: %s", uvIndex, uvRisk(uvIndex));
-  display.drawStr(0, 22, tempBuf);
-  display.drawStr(0, 32, presBuf);
-  display.drawStr(0, 42, uvBuf);
+
+  display.drawStr(0 + kXOff, 22 + kYOff, tempBuf);
+  display.drawStr(0 + kXOff, 32 + kYOff, presBuf);
+  display.drawStr(0 + kXOff, 42 + kYOff, uvBuf);
 }
 
 // ── Boot animation ────────────────────────────────────────────────────────────
@@ -291,9 +301,9 @@ void playBootAnimation() {
     if (frame % 8 == 0 && flakeCount < kMaxFlakes) makeFlake(flakes[flakeCount++]);
     if (frame > 30) {
       display.setFont(u8g2_font_ncenB10_tf);
-      display.drawStr(14, 30, "snowverlay");
+      display.drawStr(14 + kXOff, 30 + kYOff, "snowverlay");
       display.setFont(u8g2_font_5x7_tf);
-      display.drawStr(24, 45, "initializing...");
+      display.drawStr(24 + kXOff, 45 + kYOff, "initializing...");
     }
     display.sendBuffer();
     delay(33);
@@ -350,7 +360,6 @@ void setup() {
   bnoOk = bno.begin();
   if (bnoOk) bno.setExtCrystalUse(true);
 
-  // Init BLE
   Bluefruit.begin();
   Bluefruit.setTxPower(4);
   Bluefruit.setName("snowverlay");

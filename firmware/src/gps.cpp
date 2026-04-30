@@ -14,12 +14,11 @@
  */
 
 #include <Arduino.h>
-#include <Adafruit_TinyUSB.h>
 #include <SPI.h>
 #include <SparkFun_u-blox_GNSS_v3.h>
 
 namespace {
-  constexpr uint8_t kGpsCs = 11;
+  constexpr uint8_t kGpsCs = 12;
   SFE_UBLOX_GNSS_SPI gps;
 }
 
